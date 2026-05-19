@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Navigate, redirect, useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { sessionQueryOptions, useAuthClient } from "@/app";
 import { Button } from "@/components/ui/button";
@@ -12,6 +12,10 @@ type SearchParams = {
 };
 
 type AuthMethod = "near" | "email" | "phone" | "passkey" | "anonymous" | "github";
+
+type ConditionalPublicKeyCredential = typeof PublicKeyCredential & {
+  isConditionalMediationAvailable?: () => Promise<boolean>;
+};
 
 export const Route = createFileRoute("/_layout/login")({
   ssr: false,
@@ -38,6 +42,26 @@ export const Route = createFileRoute("/_layout/login")({
   component: LoginPage,
 });
 
+function getPasskeySupportError() {
+  if (typeof window === "undefined") {
+    return "Passkeys are only available in the browser.";
+  }
+  if (!window.isSecureContext) {
+    return "Passkeys require HTTPS or localhost.";
+  }
+  if (!("PublicKeyCredential" in window)) {
+    return "This browser does not support passkeys.";
+  }
+  return null;
+}
+
+function getPublicKeyCredentialConstructor() {
+  if (typeof window === "undefined" || !("PublicKeyCredential" in window)) {
+    return null;
+  }
+  return window.PublicKeyCredential as ConditionalPublicKeyCredential;
+}
+
 function LoginPage() {
   const navigate = useNavigate();
   const auth = useAuthClient();
@@ -55,19 +79,24 @@ function LoginPage() {
 
   const [isPending, setIsPending] = useState(false);
   const queryClient = useQueryClient();
+  const passkeySupportError = authMethod === "passkey" ? getPasskeySupportError() : null;
 
-  const handleSuccess = async (message: string) => {
-    const redirectTo = redirect?.startsWith("/") ? redirect : "/home";
-    toast.success(message);
-    const { data: freshSession } = await auth.getSession();
-    if (freshSession) {
-      queryClient.setQueryData(["session"], freshSession);
-    }
-    await queryClient.invalidateQueries({ queryKey: ["session"] });
-    navigate({ to: redirectTo, replace: true, search: {} });
-  };
+  const handleSuccess = useCallback(
+    async (message: string) => {
+      const redirectTo = redirect?.startsWith("/") ? redirect : "/home";
+      toast.success(message);
+      queryClient.removeQueries({ queryKey: ["passkeys"] });
+      const { data: freshSession } = await auth.getSession();
+      if (freshSession) {
+        queryClient.setQueryData(["session"], freshSession);
+      }
+      await queryClient.invalidateQueries({ queryKey: ["session"] });
+      navigate({ to: redirectTo, replace: true, search: {} });
+    },
+    [auth, navigate, queryClient, redirect],
+  );
 
-  const handleError = (error: { code?: string; message?: string } | Error) => {
+  const handleError = useCallback((error: { code?: string; message?: string } | Error) => {
     const code = "code" in error ? error.code : undefined;
     const message = "message" in error ? error.message : "Failed to sign in";
 
@@ -80,7 +109,42 @@ function LoginPage() {
     } else {
       toast.error(message || "Failed to sign in");
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    if (authMethod !== "passkey" || session?.user || getPasskeySupportError()) {
+      return;
+    }
+
+    let isActive = true;
+
+    void (async () => {
+      const credential = getPublicKeyCredentialConstructor();
+      const isConditionalAvailable = await credential?.isConditionalMediationAvailable?.();
+      if (!isConditionalAvailable || !isActive) {
+        return;
+      }
+
+      const result = await auth.signIn.passkey({
+        autoFill: true,
+        fetchOptions: {
+          onSuccess: async () => {
+            if (!isActive) return;
+            await handleSuccess("Signed in with passkey");
+          },
+          // Silence errors — Firefox always rejects conditional requests,
+          // and the user may dismiss. Never toast for a background probe.
+          onError: () => {},
+        },
+      });
+
+      void result;
+    })().catch(() => {});
+
+    return () => {
+      isActive = false;
+    };
+  }, [auth, authMethod, handleError, handleSuccess, session?.user]);
 
   const handleNear = async () => {
     setIsPending(true);
@@ -97,23 +161,93 @@ function LoginPage() {
   };
 
   const handlePasskey = async () => {
+    if (passkeySupportError) {
+      toast.error(passkeySupportError);
+      return;
+    }
+
     setIsPending(true);
+    let callbackHandled = false;
     try {
-      await auth.signIn.passkey({
+      const result = await auth.signIn.passkey({
         autoFill: false,
         fetchOptions: {
           onSuccess: async () => {
+            callbackHandled = true;
             setIsPending(false);
             await handleSuccess("Signed in with passkey");
           },
           onError: (ctx) => {
+            callbackHandled = true;
             setIsPending(false);
             handleError(new Error(ctx.error?.message || "Passkey sign in failed"));
           },
         },
       });
-    } catch {
+      if (!callbackHandled && result?.error) {
+        setIsPending(false);
+        handleError(new Error(result.error.message || "Passkey sign in failed"));
+      } else if (!callbackHandled) {
+        setIsPending(false);
+      }
+    } catch (error) {
       setIsPending(false);
+      if (!callbackHandled) {
+        handleError(error instanceof Error ? error : new Error("Passkey sign in failed"));
+      }
+    }
+  };
+
+  const handlePasskeySignUp = async () => {
+    if (passkeySupportError) {
+      toast.error(passkeySupportError);
+      return;
+    }
+    setIsPending(true);
+    try {
+      let anonOk = false;
+      await auth.signIn.anonymous({
+        fetchOptions: {
+          onSuccess: () => {
+            anonOk = true;
+          },
+          onError: (ctx) => {
+            handleError(new Error(ctx.error?.message || "Failed to create account"));
+          },
+        },
+      });
+      if (!anonOk) {
+        setIsPending(false);
+        return;
+      }
+
+      let callbackHandled = false;
+      const result = await auth.passkey.addPasskey({
+        fetchOptions: {
+          onSuccess: async () => {
+            callbackHandled = true;
+            setIsPending(false);
+            await handleSuccess("Passkey created — you're signed in");
+          },
+          onError: async (ctx) => {
+            callbackHandled = true;
+            setIsPending(false);
+            await auth.signOut();
+            handleError(new Error(ctx.error?.message || "Failed to create passkey"));
+          },
+        },
+      });
+      if (!callbackHandled) {
+        setIsPending(false);
+        if (result?.error) {
+          await auth.signOut();
+          handleError(new Error(result.error.message || "Failed to create passkey"));
+        }
+      }
+    } catch (error) {
+      setIsPending(false);
+      await auth.signOut();
+      handleError(error instanceof Error ? error : new Error("Failed to create passkey"));
     }
   };
 
@@ -283,16 +417,28 @@ function LoginPage() {
       case "passkey":
         return (
           <div className="space-y-6">
-            <UnderConstruction
-              label="passkey"
-              sourceFile="ui/src/routes/_layout/login.tsx"
-              className="mx-auto w-full max-w-xs"
-            />
             <p className="text-xs text-muted-foreground text-center leading-relaxed">
               Use Face ID, Touch ID, or security key
             </p>
-            <Button onClick={handlePasskey} disabled={isPending} className="w-full">
+            {passkeySupportError && (
+              <p className="text-xs text-destructive text-center leading-relaxed">
+                {passkeySupportError}
+              </p>
+            )}
+            <Button
+              onClick={handlePasskey}
+              disabled={isPending || !!passkeySupportError}
+              className="w-full"
+            >
               {isPending ? "authenticating..." : "sign in with passkey"}
+            </Button>
+            <Button
+              variant="outline"
+              onClick={handlePasskeySignUp}
+              disabled={isPending || !!passkeySupportError}
+              className="w-full"
+            >
+              {isPending ? "setting up..." : "sign up with passkey"}
             </Button>
           </div>
         );

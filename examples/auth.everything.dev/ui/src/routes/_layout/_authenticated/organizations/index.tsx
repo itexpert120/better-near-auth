@@ -1,22 +1,50 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { createFileRoute, Link } from "@tanstack/react-router";
-import { Building2, Plus, RefreshCw } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { createFileRoute, Link, useRouter } from "@tanstack/react-router";
+import { Building2, Mail, Plus, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
-import { type Organization, type SessionData, useAuthClient } from "@/app";
+import { type Organization, type SessionData, sessionQueryOptions, useAuthClient } from "@/app";
 import { Badge, Button, Card, CardContent, Skeleton } from "@/components";
+
+type AuthClientType = import("@/app").AuthClient;
+type UserInvitationsResponse = Awaited<
+  ReturnType<AuthClientType["organization"]["listUserInvitations"]>
+>;
+type UserInvitationItem = NonNullable<UserInvitationsResponse["data"]>[number];
 
 export const Route = createFileRoute("/_layout/_authenticated/organizations/")({
   head: () => ({
-    meta: [
-      { title: "Organizations | app" },
-      { name: "description", content: "Manage your organizations and teams." },
-    ],
+    title: "Organizations | auth.everything.dev",
+    meta: [{ name: "description", content: "Manage your organizations and teams." }],
   }),
+  loader: async ({ context }) => {
+    await context.queryClient.ensureQueryData(
+      sessionQueryOptions(context.authClient, context.session),
+    );
+    await context.queryClient.ensureQueryData({
+      queryKey: ["organizations"],
+      queryFn: async () => {
+        const { data } = await context.authClient.organization.list();
+        return (data || []) as Organization[];
+      },
+      staleTime: 30 * 1000,
+    });
+    await context.queryClient.ensureQueryData({
+      queryKey: ["user-invitations"],
+      queryFn: async (): Promise<UserInvitationItem[]> => {
+        const { data, error } = await context.authClient.organization.listUserInvitations();
+        if (error) throw new Error(error.message);
+        return (data ?? []) as UserInvitationItem[];
+      },
+      staleTime: 30 * 1000,
+    });
+  },
   component: OrganizationsList,
 });
 
 function OrganizationsList() {
   const auth = useAuthClient();
+  const router = useRouter();
+  const queryClient = useQueryClient();
   const { data: session } = useQuery<SessionData | null>({
     queryKey: ["session"],
     queryFn: async () => {
@@ -34,6 +62,56 @@ function OrganizationsList() {
     staleTime: 30 * 1000,
   });
 
+  const { data: userInvitations = [] } = useQuery({
+    queryKey: ["user-invitations"],
+    queryFn: async (): Promise<UserInvitationItem[]> => {
+      const { data, error } = await auth.organization.listUserInvitations();
+      if (error) throw new Error(error.message);
+      return (data ?? []) as UserInvitationItem[];
+    },
+    staleTime: 30 * 1000,
+  });
+
+  const pendingInvitations = userInvitations.filter((i) => i.status === "pending");
+
+  const acceptInvitationMutation = useMutation({
+    mutationFn: async (invitation: UserInvitationItem) => {
+      const { error } = await auth.organization.acceptInvitation({
+        invitationId: invitation.id,
+      });
+      if (error) throw new Error(error.message);
+      return invitation;
+    },
+    onSuccess: async (invitation) => {
+      toast.success(`Joined ${invitation.organizationName ?? "organization"}`);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["organizations"] }),
+        queryClient.invalidateQueries({ queryKey: ["session"] }),
+        queryClient.invalidateQueries({ queryKey: ["user-invitations"] }),
+      ]);
+      await queryClient.refetchQueries({ queryKey: ["organizations"] });
+      if (invitation.organizationSlug) {
+        await router.navigate({
+          to: "/organizations/$slug",
+          params: { slug: invitation.organizationSlug },
+        });
+      }
+    },
+    onError: (error: Error) => toast.error(error.message || "Failed to accept invitation"),
+  });
+
+  const rejectInvitationMutation = useMutation({
+    mutationFn: async (invitationId: string) => {
+      const { error } = await auth.organization.rejectInvitation({ invitationId });
+      if (error) throw new Error(error.message);
+    },
+    onSuccess: async () => {
+      toast.success("Invitation declined");
+      await queryClient.invalidateQueries({ queryKey: ["user-invitations"] });
+    },
+    onError: (error: Error) => toast.error(error.message || "Failed to decline invitation"),
+  });
+
   const user = session?.user;
   const activeOrgId = session?.session?.activeOrganizationId;
 
@@ -42,51 +120,96 @@ function OrganizationsList() {
       const { error } = await auth.organization.setActive({ organizationId: orgId });
       if (error) throw new Error(error.message);
     },
-    onSuccess: () => toast.success("Switched organization"),
+    onSuccess: async () => {
+      toast.success("Switched organization");
+      await queryClient.invalidateQueries({ queryKey: ["session"] });
+    },
     onError: (error: Error) => toast.error(error.message || "Failed to switch organization"),
   });
 
   const orgs = organizations || [];
 
   return (
-    <div className="space-y-8">
-      <section className="grid gap-4 lg:grid-cols-[1.15fr_0.85fr]">
-        <Card>
-          <CardContent className="p-6 sm:p-8 space-y-4">
-            <div className="flex flex-wrap items-center gap-2">
-              <Badge variant="outline">organizations</Badge>
-              {activeOrgId && <Badge variant="outline">active set</Badge>}
-            </div>
-            <div className="space-y-2">
-              <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight">
-                Workspace Groups
-              </h1>
-              <p className="text-sm text-muted-foreground leading-relaxed">
-                Switch contexts, create new organizations, and open team-specific member and API key
-                management flows.
-              </p>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button asChild>
-                <Link to="/organizations/new">
-                  <Plus className="h-4 w-4 mr-1.5" />
-                  new organization
-                </Link>
-              </Button>
-              <Button asChild variant="outline">
-                <Link to="/home">back to workspace</Link>
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
+    <div className="space-y-6">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Organizations</h1>
+          <p className="text-sm text-muted-foreground">
+            Manage workspaces, members, invitations, and organization API keys.
+          </p>
+        </div>
+        <Button asChild variant="outline" size="sm">
+          <Link to="/organizations/new">
+            <Plus className="h-4 w-4 mr-1.5" />
+            new organization
+          </Link>
+        </Button>
+      </div>
 
-        <Card>
-          <CardContent className="p-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
-            <StatBox label="total" value={String(orgs.length)} />
-            <StatBox label="active" value={activeOrgId ? "yes" : "no"} />
-          </CardContent>
-        </Card>
-      </section>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        <StatBox label="total" value={String(orgs.length)} />
+        <StatBox label="active" value={activeOrgId ? "yes" : "no"} />
+        <StatBox label="invites" value={String(pendingInvitations.length)} />
+      </div>
+
+      {pendingInvitations.length > 0 && (
+        <section className="space-y-3">
+          <h2 className="text-sm font-medium uppercase tracking-wide text-muted-foreground">
+            Pending Invitations ({pendingInvitations.length})
+          </h2>
+          <div className="grid gap-3 md:grid-cols-2">
+            {pendingInvitations.map((invitation) => (
+              <Card key={invitation.id}>
+                <CardContent className="p-5 space-y-3">
+                  <div className="flex items-start gap-3">
+                    <div className="w-10 h-10 border-2 border-outset border-border flex items-center justify-center shrink-0">
+                      <Mail className="h-4 w-4 text-muted-foreground" />
+                    </div>
+                    <div className="space-y-1 min-w-0 flex-1">
+                      <div className="font-medium break-all">
+                        {invitation.organizationName ?? invitation.organizationSlug}
+                      </div>
+                      <div className="text-xs text-muted-foreground font-mono">
+                        invited as {invitation.role ?? "member"}
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        expires {new Date(invitation.expiresAt).toLocaleDateString()}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      onClick={() => acceptInvitationMutation.mutate(invitation)}
+                      disabled={
+                        acceptInvitationMutation.isPending || rejectInvitationMutation.isPending
+                      }
+                      size="sm"
+                    >
+                      {acceptInvitationMutation.isPending &&
+                      acceptInvitationMutation.variables?.id === invitation.id
+                        ? "accepting..."
+                        : "accept"}
+                    </Button>
+                    <Button
+                      onClick={() => rejectInvitationMutation.mutate(invitation.id)}
+                      disabled={
+                        acceptInvitationMutation.isPending || rejectInvitationMutation.isPending
+                      }
+                      variant="outline"
+                      size="sm"
+                    >
+                      {rejectInvitationMutation.isPending &&
+                      rejectInvitationMutation.variables === invitation.id
+                        ? "declining..."
+                        : "decline"}
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        </section>
+      )}
 
       {isLoading ? (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -124,7 +247,7 @@ function OrganizationsList() {
           {orgs.map((org: Organization) => {
             const isActive = org.id === activeOrgId;
             const isPersonal = user
-              ? org.slug === user.id || (org.metadata as any)?.isPersonal === true
+              ? org.slug === user.id || org.metadata?.isPersonal === true
               : false;
 
             return (

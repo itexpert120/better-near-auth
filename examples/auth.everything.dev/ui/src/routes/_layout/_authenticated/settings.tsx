@@ -2,54 +2,42 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { toast } from "sonner";
-import {
-  type Passkey,
-  type SessionData,
-  sessionQueryOptions,
-  useApiClient,
-  useAuthClient,
-} from "@/app";
-import {
-  ApiKeyForm,
-  ApiKeyReveal,
-  Badge,
-  Button,
-  Card,
-  CardContent,
-  ConfirmDialog,
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from "@/components";
+import { type SessionData, sessionQueryOptions, useAuthClient } from "@/app";
+import { Button, Card, CardContent } from "@/components";
+import { useUserPasskeys } from "@/components/settings-sections";
 import { Input } from "@/components/ui/input";
 
 export const Route = createFileRoute("/_layout/_authenticated/settings")({
   head: () => ({
+    title: "Settings | auth.everything.dev",
     meta: [
-      { title: "Settings | app" },
       {
         name: "description",
-        content: "Manage your account and authentication methods.",
+        content: "Manage your account identity and security.",
       },
     ],
   }),
+  loader: async ({ context }) => {
+    await context.queryClient.ensureQueryData(
+      sessionQueryOptions(context.authClient, context.session),
+    );
+    await context.queryClient.ensureQueryData({
+      queryKey: ["passkeys"],
+      queryFn: async () => {
+        const { data } = await context.authClient.passkey.listUserPasskeys();
+        return (data || []) as any[];
+      },
+      staleTime: 60 * 1000,
+    });
+  },
   component: Settings,
 });
 
 function Settings() {
   const auth = useAuthClient();
   const { data: session } = useQuery<SessionData | null>(sessionQueryOptions(auth));
-  const { data: passkeys = [] } = useQuery({
-    queryKey: ["passkeys"],
-    queryFn: async () => {
-      const { data } = await auth.passkey.listUserPasskeys();
-      return (data || []) as Passkey[];
-    },
-    staleTime: 60 * 1000,
-  });
-
   const user = session?.user;
+  const { data: passkeys = [] } = useUserPasskeys(!!user);
   const nearAccountId = auth.near.getAccountId();
 
   if (!user) {
@@ -58,12 +46,10 @@ function Settings() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
-          <p className="text-sm text-muted-foreground">
-            Manage your identity, authentication methods, and security.
-          </p>
+          <p className="text-sm text-muted-foreground">Manage identity and session security.</p>
         </div>
         <Button asChild variant="outline" size="sm">
           <Link to="/home">back to workspace</Link>
@@ -77,30 +63,19 @@ function Settings() {
         <MiniStat label="profile" value={user.isAnonymous ? "temporary" : "persistent"} />
       </div>
 
-      <Tabs defaultValue="identity" className="w-full">
-        <TabsList className="w-full justify-start">
-          <TabsTrigger value="identity">Identity</TabsTrigger>
-          <TabsTrigger value="auth">Auth Methods</TabsTrigger>
-          <TabsTrigger value="apikeys">API Keys</TabsTrigger>
-          <TabsTrigger value="security">Security</TabsTrigger>
-        </TabsList>
+      <section className="space-y-3">
+        <h2 className="text-sm font-medium uppercase tracking-wide text-muted-foreground">
+          Identity
+        </h2>
+        <IdentityTab user={user} />
+      </section>
 
-        <TabsContent value="identity" className="space-y-6 pt-4">
-          <IdentityTab user={user} />
-        </TabsContent>
-
-        <TabsContent value="auth" className="space-y-6 pt-4">
-          <AuthMethodsTab user={user} passkeys={passkeys} nearAccountId={nearAccountId} />
-        </TabsContent>
-
-        <TabsContent value="apikeys" className="space-y-6 pt-4">
-          <ApiKeysTab />
-        </TabsContent>
-
-        <TabsContent value="security" className="space-y-6 pt-4">
-          <SecurityTab user={user} />
-        </TabsContent>
-      </Tabs>
+      <section className="space-y-3">
+        <h2 className="text-sm font-medium uppercase tracking-wide text-muted-foreground">
+          Security
+        </h2>
+        <SecurityTab user={user} />
+      </section>
     </div>
   );
 }
@@ -176,252 +151,6 @@ function IdentityTab({
   );
 }
 
-function AuthMethodsTab({
-  user,
-  passkeys,
-  nearAccountId,
-}: {
-  user: { email?: string; isAnonymous?: boolean | null };
-  passkeys: Array<{ id: string; name?: string }>;
-  nearAccountId: string | null;
-}) {
-  const auth = useAuthClient();
-
-  const addPasskeyMutation = useMutation({
-    mutationFn: async () => {
-      const { error } = await auth.passkey.addPasskey();
-      if (error) throw new Error(error.message);
-    },
-    onSuccess: () => toast.success("Passkey added"),
-    onError: (err: Error) => toast.error(err.message),
-  });
-
-  const removePasskeyMutation = useMutation({
-    mutationFn: async (passkeyId: string) => {
-      const { error } = await auth.passkey.deletePasskey({ id: passkeyId });
-      if (error) throw new Error(error.message);
-    },
-    onSuccess: () => toast.success("Passkey removed"),
-    onError: (err: Error) => toast.error(err.message),
-  });
-
-  const linkNearMutation = useMutation({
-    mutationFn: async () => {
-      await auth.signIn.near();
-    },
-    onSuccess: () => toast.success("NEAR wallet linked"),
-    onError: (err: Error) => toast.error(err.message),
-  });
-
-  return (
-    <div className="grid gap-4 lg:grid-cols-3">
-      <MethodCard title="email" status={user.email ? "linked" : "missing"}>
-        <p className="text-sm text-muted-foreground">
-          {user.email ?? "Email login has not been linked for this account yet."}
-        </p>
-      </MethodCard>
-
-      <MethodCard title="near" status={nearAccountId ? "linked" : "missing"}>
-        {nearAccountId ? (
-          <div className="border-2 border-outset border-[rgb(51,51,51)] dark:border-[rgb(100,100,100)] bg-muted/30 p-3 font-mono text-xs break-all">
-            {nearAccountId}
-          </div>
-        ) : (
-          <Button
-            onClick={() => linkNearMutation.mutate()}
-            disabled={linkNearMutation.isPending}
-            variant="outline"
-            size="sm"
-          >
-            {linkNearMutation.isPending ? "linking..." : "link NEAR wallet"}
-          </Button>
-        )}
-      </MethodCard>
-
-      <MethodCard
-        title="passkeys"
-        status={passkeys.length > 0 ? `${passkeys.length} linked` : "missing"}
-      >
-        <div className="space-y-2">
-          {passkeys.length > 0 ? (
-            passkeys.map((passkey) => (
-              <div
-                key={passkey.id}
-                className="border-2 border-outset border-[rgb(51,51,51)] dark:border-[rgb(100,100,100)] bg-muted/30 p-3 flex items-center justify-between gap-3"
-              >
-                <span className="text-sm truncate">{passkey.name || "Passkey"}</span>
-                <Button
-                  onClick={() => removePasskeyMutation.mutate(passkey.id)}
-                  disabled={removePasskeyMutation.isPending}
-                  variant="outline"
-                  size="sm"
-                >
-                  remove
-                </Button>
-              </div>
-            ))
-          ) : (
-            <p className="text-sm text-muted-foreground">No passkeys registered yet.</p>
-          )}
-          <Button
-            onClick={() => addPasskeyMutation.mutate()}
-            disabled={addPasskeyMutation.isPending}
-            variant="outline"
-            size="sm"
-          >
-            {addPasskeyMutation.isPending ? "adding..." : "add passkey"}
-          </Button>
-        </div>
-      </MethodCard>
-    </div>
-  );
-}
-
-function ApiKeysTab() {
-  const apiClient = useApiClient();
-  const queryClient = useQueryClient();
-  const [createdApiKey, setCreatedApiKey] = useState<any>(null);
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const [confirmConfig, setConfirmConfig] = useState({
-    title: "",
-    description: "",
-    onConfirm: () => {},
-    keyId: "",
-  });
-
-  const { data: apiKeys = [], isLoading } = useQuery({
-    queryKey: ["user-api-keys"],
-    queryFn: async () => {
-      const res = await apiClient.auth.listApiKeys({});
-      return res ?? [];
-    },
-  });
-
-  const createMutation = useMutation({
-    mutationFn: (params: { name: string; permissions?: Record<string, string[]> }) =>
-      apiClient.auth.createApiKey({ name: params.name, permissions: params.permissions }),
-    onSuccess: (data) => {
-      setCreatedApiKey(data);
-      toast.success("API key created");
-      queryClient.invalidateQueries({ queryKey: ["user-api-keys"] });
-    },
-    onError: (error: Error) => toast.error(error.message || "Failed to create API key"),
-  });
-
-  const deleteMutation = useMutation({
-    mutationFn: (keyId: string) => apiClient.auth.deleteApiKey({ id: keyId }),
-    onSuccess: () => {
-      toast.success("API key deleted");
-      queryClient.invalidateQueries({ queryKey: ["user-api-keys"] });
-    },
-    onError: (error: Error) => toast.error(error.message || "Failed to delete API key"),
-  });
-
-  const handleDelete = (keyId: string) => {
-    setConfirmConfig({
-      title: "Delete API key",
-      description:
-        "This API key will be permanently revoked. Any services using it will stop working.",
-      keyId,
-      onConfirm: () => {
-        deleteMutation.mutate(keyId);
-        setConfirmOpen(false);
-      },
-    });
-    setConfirmOpen(true);
-  };
-
-  return (
-    <div className="space-y-6">
-      <Card>
-        <CardContent className="p-6">
-          <ApiKeyForm
-            orgId=""
-            onCreate={(name, permissions) => createMutation.mutate({ name, permissions })}
-            isPending={createMutation.isPending}
-          />
-        </CardContent>
-      </Card>
-
-      {createdApiKey && (
-        <ApiKeyReveal apiKey={createdApiKey} onDismiss={() => setCreatedApiKey(null)} />
-      )}
-
-      {isLoading ? (
-        <Card>
-          <CardContent className="p-8 text-center text-sm text-muted-foreground">
-            Loading API keys...
-          </CardContent>
-        </Card>
-      ) : apiKeys.length > 0 ? (
-        <div className="grid gap-4 md:grid-cols-2">
-          {apiKeys.map((key) => (
-            <Card key={key.id}>
-              <CardContent className="p-5 space-y-3">
-                <div className="space-y-1">
-                  <div className="font-medium break-all">{key.name ?? "unnamed"}</div>
-                  <div className="text-xs text-muted-foreground font-mono">
-                    {key.prefix ?? "api_"}...
-                  </div>
-                </div>
-                {(() => {
-                  const perms = key.permissions;
-                  if (!perms || typeof perms !== "object") return null;
-                  const entries = Object.entries(perms as Record<string, string[]>);
-                  if (entries.length === 0) return null;
-                  return (
-                    <div className="flex flex-wrap gap-1">
-                      {entries.flatMap(([scope, actions]) =>
-                        actions.map((action) => (
-                          <Badge
-                            key={`${scope}:${action}`}
-                            variant="outline"
-                            className="text-[10px]"
-                          >
-                            {scope}:{action}
-                          </Badge>
-                        )),
-                      )}
-                    </div>
-                  );
-                })()}
-                <div className="text-xs text-muted-foreground">
-                  created {new Date(key.createdAt).toLocaleString()}
-                </div>
-                <Button
-                  onClick={() => handleDelete(key.id)}
-                  disabled={deleteMutation.isPending}
-                  variant="outline"
-                  size="sm"
-                  className="text-destructive hover:text-destructive"
-                >
-                  delete key
-                </Button>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
-      ) : (
-        <Card>
-          <CardContent className="p-8 text-center text-sm text-muted-foreground">
-            No personal API keys
-          </CardContent>
-        </Card>
-      )}
-
-      <ConfirmDialog
-        open={confirmOpen}
-        onOpenChange={setConfirmOpen}
-        title={confirmConfig.title}
-        description={confirmConfig.description}
-        variant="destructive"
-        onConfirm={confirmConfig.onConfirm}
-        isPending={deleteMutation.isPending}
-      />
-    </div>
-  );
-}
-
 function SecurityTab({ user }: { user: { email?: string; isAnonymous?: boolean | null } }) {
   const auth = useAuthClient();
   const queryClient = useQueryClient();
@@ -474,6 +203,7 @@ function SecurityTab({ user }: { user: { email?: string; isAnonymous?: boolean |
     },
     onSuccess: async () => {
       queryClient.setQueryData(["session"], null);
+      queryClient.removeQueries({ queryKey: ["passkeys"] });
       await queryClient.invalidateQueries({ queryKey: ["session"] });
       navigate({ to: "/", replace: true });
     },
@@ -570,28 +300,6 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <div className="text-xs uppercase tracking-wide text-muted-foreground">{label}</div>
       {children}
     </div>
-  );
-}
-
-function MethodCard({
-  title,
-  status,
-  children,
-}: {
-  title: string;
-  status: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <Card>
-      <CardContent className="p-5 space-y-4">
-        <div className="flex items-center justify-between gap-3">
-          <div className="font-medium">{title}</div>
-          <Badge variant="outline">{status}</Badge>
-        </div>
-        {children}
-      </CardContent>
-    </Card>
   );
 }
 

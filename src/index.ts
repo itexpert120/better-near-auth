@@ -1,7 +1,8 @@
 import { APIError, createAuthEndpoint, createAuthMiddleware, sessionMiddleware } from "better-auth/api";
 import { setSessionCookie } from "better-auth/cookies";
 import type { Account, BetterAuthPlugin, User, DBAdapter } from "better-auth/types";
-import { Near, generateNonce, generateKey, parseKey, verifyNep413Signature, decodeSignedDelegateAction, InMemoryKeyStore, RotatingKeyStore } from "near-kit";
+import { Near, generateNonce, generateKey, parseKey, verifyNep413Signature, decodeSignedDelegateAction, InMemoryKeyStore, RotatingKeyStore, formatAmount, STORAGE_AMOUNT_PER_BYTE } from "near-kit";
+import type { AccountState } from "near-kit";
 import type { SignedMessage, SignMessageParams, SignedDelegateAction } from "near-kit";
 import { hex, base58 } from "@scure/base";
 import z from "zod";
@@ -9,6 +10,8 @@ import { defaultGetProfile, getImageUrl, getNetworkFromAccountId } from "./profi
 import { schema } from "./schema.js";
 import type {
 	AccountId,
+	ListAccountsResponseT,
+	ListedNearAccount,
 	NearAccount,
 	Profile,
 	RelayerInfo,
@@ -25,6 +28,7 @@ import {
 	RelayRequest,
 	RelayResponse,
 	RelayStatusResponse,
+	SetPrimaryAccountRequest,
 	ViewContractRequest,
 	ViewContractResponse,
 } from "./types.js";
@@ -49,6 +53,44 @@ function deriveEmail(accountId: string): string | null {
 		return `${localPart}@near.email`;
 	}
 	return null;
+}
+
+function nearAccountKey(account: Pick<NearAccount, "accountId" | "network">): string {
+	return `${account.accountId}:${account.network}`;
+}
+
+function getCreatedAtTime(account: NearAccount): number {
+	return account.createdAt instanceof Date
+		? account.createdAt.getTime()
+		: new Date(account.createdAt).getTime();
+}
+
+function buildListAccountsResponse(nearAccounts: NearAccount[]): ListAccountsResponseT {
+	const activeAccount = nearAccounts.find((account) => account.isPrimary) ?? nearAccounts[0] ?? null;
+	const activeKey = activeAccount ? nearAccountKey(activeAccount) : null;
+	const accounts: ListedNearAccount[] = nearAccounts
+		.map((account) => {
+			const isActive = activeKey === nearAccountKey(account);
+			return {
+				...account,
+				providerId: "siwn" as const,
+				isActive,
+				isAvailable: !isActive,
+			};
+		})
+		.sort((a, b) => {
+			if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+			return getCreatedAtTime(a) - getCreatedAtTime(b);
+		});
+	const listedActiveAccount = accounts.find((account) => account.isActive) ?? null;
+
+	return {
+		accounts,
+		activeAccount: listedActiveAccount ? { ...listedActiveAccount } : null,
+		availableAccounts: accounts
+			.filter((account) => account.isAvailable)
+			.map((account) => ({ ...account })),
+	};
 }
 
 export interface RelayerConfig {
@@ -189,6 +231,72 @@ async function initRelayer(
 		network,
 		mode: "ephemeral",
 		createdAt: new Date(),
+	};
+}
+
+const RELAYER_BALANCE_PRECISION = 6;
+
+function calculateAvailableBalanceYocto(
+	amount: string,
+	locked: string,
+	storageUsage: number,
+): bigint {
+	const amountBigInt = BigInt(amount);
+	const lockedBigInt = BigInt(locked);
+	const storageRequired = STORAGE_AMOUNT_PER_BYTE * BigInt(storageUsage);
+
+	if (lockedBigInt >= storageRequired) {
+		return amountBigInt;
+	}
+
+	const reservedForStorage = storageRequired - lockedBigInt;
+	if (reservedForStorage >= amountBigInt) {
+		return BigInt(0);
+	}
+
+	return amountBigInt - reservedForStorage;
+}
+
+type RawNearAccountView = {
+	amount: string;
+	locked: string;
+	storage_usage: number;
+	code_hash: string;
+};
+
+async function getRelayerAccountState(
+	near: Near,
+	accountId: string,
+): Promise<AccountState> {
+	const account = await (
+		near as unknown as {
+			rpc: { getAccount: (id: string) => Promise<RawNearAccountView> };
+		}
+	).rpc.getAccount(accountId);
+	const available = calculateAvailableBalanceYocto(
+		account.amount,
+		account.locked,
+		account.storage_usage,
+	);
+	const storageRequired = STORAGE_AMOUNT_PER_BYTE * BigInt(account.storage_usage);
+	const emptyCodeHash = "11111111111111111111111111111111";
+	const balanceFormat = {
+		precision: RELAYER_BALANCE_PRECISION,
+		includeSuffix: false,
+		trimZeros: true,
+	} as const;
+
+	return {
+		balance: formatAmount(account.amount, balanceFormat),
+		available: formatAmount(available.toString(), balanceFormat),
+		staked: formatAmount(account.locked, balanceFormat),
+		storageUsage: formatAmount(storageRequired.toString(), {
+			precision: 4,
+			includeSuffix: false,
+		}),
+		storageBytes: account.storage_usage,
+		hasContract: account.code_hash !== emptyCodeHash,
+		codeHash: account.code_hash,
 	};
 }
 
@@ -530,7 +638,60 @@ export const siwn = (options: SIWNPluginOptions): BetterAuthPlugin => {
 						where: [{ field: "userId", operator: "eq", value: session.user.id }],
 					});
 
-					return ctx.json({ accounts: nearAccounts });
+					return ctx.json(buildListAccountsResponse(nearAccounts));
+				},
+			),
+			setPrimaryNearAccount: createAuthEndpoint(
+				"/near/set-primary-account",
+				{
+					method: "POST",
+					body: SetPrimaryAccountRequest,
+					use: [sessionMiddleware],
+				},
+				async (ctx) => {
+					const { accountId, network: providedNetwork } = ctx.body;
+					const session = ctx.context.session;
+					const network = providedNetwork || getNetworkFromAccountId(accountId);
+
+					const targetAccount: NearAccount | null = await ctx.context.adapter.findOne({
+						model: "nearAccount",
+						where: [
+							{ field: "userId", operator: "eq", value: session.user.id },
+							{ field: "accountId", operator: "eq", value: accountId },
+							{ field: "network", operator: "eq", value: network },
+						],
+					});
+
+					if (!targetAccount) {
+						throw new APIError("NOT_FOUND", {
+							message: "NEAR account not found or not linked to your user",
+							status: 404,
+						});
+					}
+
+					const nearAccounts: NearAccount[] = await ctx.context.adapter.findMany({
+						model: "nearAccount",
+						where: [{ field: "userId", operator: "eq", value: session.user.id }],
+					});
+
+					await Promise.all(nearAccounts.map((account) => ctx.context.adapter.update({
+						model: "nearAccount",
+						where: [{ field: "id", operator: "eq", value: account.id }],
+						update: { isPrimary: nearAccountKey(account) === nearAccountKey(targetAccount) },
+					})));
+
+					const updatedNearAccounts: NearAccount[] = await ctx.context.adapter.findMany({
+						model: "nearAccount",
+						where: [{ field: "userId", operator: "eq", value: session.user.id }],
+					});
+
+					return ctx.json({
+						success: true,
+						accountId,
+						network,
+						message: "Primary NEAR account updated",
+						...buildListAccountsResponse(updatedNearAccounts),
+					});
 				},
 			),
 			getSiwnNonce: createAuthEndpoint(
@@ -1042,17 +1203,26 @@ export const siwn = (options: SIWNPluginOptions): BetterAuthPlugin => {
 						],
 					});
 
-					const network = (nearAccount?.network || "mainnet") as "mainnet" | "testnet";
+					let network = (nearAccount?.network || "mainnet") as "mainnet" | "testnet";
+					if (!nearAccount) {
+						const storedKeys = await ctx.context.adapter.findMany<{ network: string }>({
+							model: "relayerKey",
+						});
+						const storedNetwork = storedKeys?.[0]?.network;
+						if (storedNetwork === "mainnet" || storedNetwork === "testnet") {
+							network = storedNetwork;
+						}
+					}
+
 					const rState = await ensureRelayer(ctx.context.adapter, ctx.context.secret, network);
 
 					if (!rState) {
 						return ctx.json({ enabled: false } satisfies Partial<RelayerInfo> & { enabled: boolean });
 					}
 
-					const near = getNear(network);
-					let account;
+					let account: AccountState;
 					try {
-						account = await near.getAccount(rState.accountId);
+						account = await getRelayerAccountState(rState.near, rState.accountId);
 					} catch {
 						account = {
 							balance: "0",

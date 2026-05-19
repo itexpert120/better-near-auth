@@ -3,10 +3,85 @@ import { passkey } from "@better-auth/passkey";
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { admin, anonymous, organization, phoneNumber } from "better-auth/plugins";
+import { createAccessControl } from "better-auth/plugins/access";
+import {
+  adminAc,
+  defaultStatements,
+  memberAc,
+  ownerAc,
+} from "better-auth/plugins/organization/access";
 import { siwn } from "better-near-auth";
+
+const orgStatements = {
+  ...defaultStatements,
+  apiKey: ["create", "read", "update", "delete"],
+} as const;
+
+const orgAc = createAccessControl(orgStatements);
+
+const orgRoles = {
+  owner: orgAc.newRole({
+    ...ownerAc.statements,
+    apiKey: ["create", "read", "update", "delete"],
+  }),
+  admin: orgAc.newRole({
+    ...adminAc.statements,
+    apiKey: ["create", "read", "update", "delete"],
+  }),
+  member: orgAc.newRole({
+    ...memberAc.statements,
+    apiKey: ["read"],
+  }),
+};
+
 import type { AuthConfig } from "./auth-export";
 import type { AuthDatabase } from "./db/driver";
 import * as schema from "./db/schema";
+
+export interface PasskeyRelyingPartyOptions {
+  rpID: string;
+  rpName: string;
+  origin: string;
+}
+
+function normalizeOrigin(value: string): string {
+  try {
+    if (/^https?:\/\//i.test(value)) {
+      return new URL(value).origin;
+    }
+    const hostname = new URL(`https://${value}`).hostname;
+    const protocol = hostname === "localhost" || hostname === "127.0.0.1" ? "http" : "https";
+    return new URL(`${protocol}://${value}`).origin;
+  } catch {
+    throw new Error(`Invalid passkey origin value: "${value}". Must be a valid URL or hostname.`);
+  }
+}
+
+function normalizeRpId(value: string): string {
+  try {
+    const hostname = /^https?:\/\//i.test(value)
+      ? new URL(value).hostname
+      : new URL(`https://${value}`).hostname;
+    if (!hostname) {
+      throw new TypeError("Missing hostname");
+    }
+    return hostname;
+  } catch {
+    throw new Error(`Invalid passkey RP ID value: "${value}". Must be a valid domain or URL.`);
+  }
+}
+
+export function resolvePasskeyRelyingPartyOptions(
+  config: Pick<AuthConfig, "baseUrl" | "passkeyOrigin" | "passkeyRpId" | "passkeyRpName">,
+): PasskeyRelyingPartyOptions {
+  const origin = normalizeOrigin(config.passkeyOrigin?.trim() || config.baseUrl);
+  const rpID = config.passkeyRpId?.trim()
+    ? normalizeRpId(config.passkeyRpId.trim())
+    : new URL(origin).hostname;
+  const rpName = config.passkeyRpName?.trim() || "Everything Dev";
+
+  return { rpID, rpName, origin };
+}
 
 async function sendEmail({ to, subject, text }: { to: string; subject: string; text: string }) {
   console.log(`\n📧 [Email Preview] ============================================`);
@@ -17,7 +92,33 @@ async function sendEmail({ to, subject, text }: { to: string; subject: string; t
   console.log(`================================================================\n`);
 }
 
-async function sendSMS({ phoneNumber, code }: { phoneNumber: string; code: string }) {
+async function sendSMS(
+  { phoneNumber, code }: { phoneNumber: string; code: string },
+  twilio?: { accountSid: string; authToken: string; phoneNumber: string },
+) {
+  if (twilio) {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${twilio.accountSid}/Messages.json`;
+    const body = new URLSearchParams({
+      To: phoneNumber,
+      From: twilio.phoneNumber,
+      Body: `Your verification code is: ${code}`,
+    });
+    const res = await fetch(url, {
+      method: "POST",
+      signal: AbortSignal.timeout(10_000),
+      headers: {
+        Authorization: `Basic ${btoa(`${twilio.accountSid}:${twilio.authToken}`)}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Twilio error ${res.status}: ${text}`);
+    }
+    return;
+  }
+
   console.log(`\n📱 [SMS Preview] ================================================`);
   console.log(`To: ${phoneNumber}`);
   console.log(`Code: ${code}`);
@@ -70,6 +171,16 @@ async function createPersonalOrganization(
 }
 
 export function createAuthInstance(config: AuthConfig, db: AuthDatabase) {
+  const passkeyOptions = resolvePasskeyRelyingPartyOptions(config);
+  const twilioConfig =
+    config.twilioAccountSid && config.twilioAuthToken && config.twilioPhoneNumber
+      ? {
+          accountSid: config.twilioAccountSid,
+          authToken: config.twilioAuthToken,
+          phoneNumber: config.twilioPhoneNumber,
+        }
+      : undefined;
+
   return betterAuth({
     database: drizzleAdapter(db, {
       provider: "pg",
@@ -93,17 +204,23 @@ export function createAuthInstance(config: AuthConfig, db: AuthDatabase) {
       }),
       admin({ defaultRole: "user", adminRoles: ["admin"] }),
       anonymous({ emailDomainName: config.account }),
-      phoneNumber({
-        sendOTP: async ({ phoneNumber, code }) => {
-          await sendSMS({ phoneNumber, code });
-        },
-        signUpOnVerification: {
-          getTempEmail: (phoneNumber) => `${phoneNumber}@${config.account}`,
-          getTempName: (phoneNumber) => phoneNumber,
-        },
-      }),
-      passkey(),
+      ...(twilioConfig
+        ? [
+            phoneNumber({
+              sendOTP: async ({ phoneNumber, code }) => {
+                await sendSMS({ phoneNumber, code }, twilioConfig);
+              },
+              signUpOnVerification: {
+                getTempEmail: (phoneNumber) => `${phoneNumber}@${config.account}`,
+                getTempName: (phoneNumber) => phoneNumber,
+              },
+            }),
+          ]
+        : []),
+      passkey(passkeyOptions),
       organization({
+        ac: orgAc,
+        roles: orgRoles,
         async sendInvitationEmail(data) {
           const inviteLink = `${config.baseUrl}/accept-invitation/${data.id}`;
           await sendEmail({
@@ -113,7 +230,10 @@ export function createAuthInstance(config: AuthConfig, db: AuthDatabase) {
           });
         },
       }),
-      apiKey(),
+      apiKey([
+        { configId: "user-keys", defaultPrefix: "api_", references: "user" },
+        { configId: "org-keys", defaultPrefix: "org_", references: "organization" },
+      ]),
     ],
     emailAndPassword: {
       enabled: true,

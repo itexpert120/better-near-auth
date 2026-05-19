@@ -1,7 +1,7 @@
 import { authClient } from "@/lib/auth-client";
 import { getNearAccountId, getLinkedProviders } from "@/lib/auth-utils";
 import { orpc } from "@/utils/orpc";
-import { createFileRoute, redirect } from "@tanstack/react-router";
+import { createFileRoute, redirect, useRouter } from "@tanstack/react-router";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardAction } from "@/components/ui/card";
 import { User, ExternalLink, Unlink, ShieldCheck, Clock, Key, Link2, Focus, UserMinus } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -74,6 +74,10 @@ function getProviderName(providerId: string) {
   }
 }
 
+function getAccountProviderId(account: any): string {
+  return account?.providerId ?? (account?.accountId ? "siwn" : "unknown");
+}
+
 export const Route = createFileRoute("/_layout/dashboard")({
   beforeLoad: async ({ location }) => {
     const { data: session } = await authClient.getSession();
@@ -96,11 +100,12 @@ export const Route = createFileRoute("/_layout/dashboard")({
     ]);
 
     const session = sessionRes.data;
-    const linkedAccounts = Array.isArray(accountsRes?.data) ? accountsRes.data : [];
+    const linkedAccounts = accountsRes?.data?.accounts ?? [];
+    const activeNearAccount = accountsRes?.data?.activeAccount ?? null;
     const sessionNearAccountId = (session?.user as any)?.nearAccount?.accountId;
-    const nearAccountId = sessionNearAccountId
+    const nearAccountId = activeNearAccount?.accountId ?? (sessionNearAccountId
       ? sessionNearAccountId.split(":")[0]
-      : getNearAccountId(linkedAccounts);
+      : getNearAccountId(linkedAccounts));
     const linkedProviders = getLinkedProviders(linkedAccounts);
 
     return {
@@ -153,6 +158,17 @@ function ProfileCard({ user, nearAccountId, linkedProviders, linkedAccounts }: {
   const displayName = user?.name || nearAccountId || "User";
   const displayEmail = user?.email;
   const initial = (displayName)?.charAt(0).toUpperCase();
+  const currentNearAccount = linkedAccounts.find(
+    (account) =>
+      getAccountProviderId(account) === "siwn" &&
+      account.accountId?.split(":")[0] === nearAccountId,
+  );
+  const canUnlinkNearAccount = Boolean(
+    currentNearAccount &&
+      !currentNearAccount.isActive &&
+      !currentNearAccount.isPrimary &&
+      linkedAccounts.length > 1,
+  );
 
   return (
     <Card>
@@ -205,14 +221,21 @@ function ProfileCard({ user, nearAccountId, linkedProviders, linkedAccounts }: {
               <Button variant="ghost" size="sm" asChild className="h-7 px-2 text-xs">
                 <a href={`/profile/${nearAccountId}`} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1">
                   <ExternalLink className="h-3 w-3" />
+                  Social
                 </a>
               </Button>
               <Button
                 variant="ghost"
                 size="sm"
                 className="h-7 px-2 text-xs text-destructive hover:text-destructive"
-                disabled={isUnlinking}
+                disabled={isUnlinking || !canUnlinkNearAccount}
+                title={
+                  canUnlinkNearAccount
+                    ? "Unlink NEAR account"
+                    : "Active NEAR account can't be unlinked here"
+                }
                 onClick={async () => {
+                  if (!canUnlinkNearAccount) return;
                   setIsUnlinking(true);
                   try {
                     const [accountId, network] = nearAccountId.includes(":")
@@ -220,7 +243,10 @@ function ProfileCard({ user, nearAccountId, linkedProviders, linkedAccounts }: {
                       : [nearAccountId, "mainnet"];
                     const response = await authClient.near.unlink({
                       accountId,
-                      network: (network as "mainnet" | "testnet") || "mainnet",
+                      network:
+                        (currentNearAccount?.network as "mainnet" | "testnet") ||
+                        (network as "mainnet" | "testnet") ||
+                        "mainnet",
                     });
                     if (response.data?.success) {
                       toast.success("NEAR account unlinked");
@@ -400,6 +426,7 @@ function AccountLinkingCard({ linkedAccounts, nearAccountId }: {
   nearAccountId: string | null;
 }) {
   const queryClient = useQueryClient();
+  const router = useRouter();
   const [isLinkingGoogle, setIsLinkingGoogle] = useState(false);
   const [isLinkingGitHub, setIsLinkingGitHub] = useState(false);
   const [isProcessingNear, setIsProcessingNear] = useState(false);
@@ -408,8 +435,10 @@ function AccountLinkingCard({ linkedAccounts, nearAccountId }: {
   const walletAccountId = authClient.near.getAccountId();
   const accounts = linkedAccounts;
 
-  const invalidateAccounts = () =>
-    queryClient.invalidateQueries({ queryKey: ["near-accounts"] });
+  const invalidateAccounts = () => {
+    void queryClient.invalidateQueries({ queryKey: ["near-accounts"] });
+    void router.invalidate();
+  };
 
   const handleLinkSocial = async (providerId: "google" | "github") => {
     if (providerId === "google") setIsLinkingGoogle(true);
@@ -453,10 +482,10 @@ function AccountLinkingCard({ linkedAccounts, nearAccountId }: {
   const handleUnlinkNearAccount = async (account: any) => {
     setIsUnlinking(account.accountId);
     try {
-      const [accountId, network] = account.accountId.split(":");
+      const [accountId, fallbackNetwork] = account.accountId.split(":");
       const response = await authClient.near.unlink({
         accountId,
-        network: (network as "mainnet" | "testnet") || "mainnet",
+        network: (account.network as "mainnet" | "testnet") || (fallbackNetwork as "mainnet" | "testnet") || "mainnet",
       });
       if (response.data?.success) {
         toast.success("NEAR account unlinked successfully");
@@ -467,6 +496,27 @@ function AccountLinkingCard({ linkedAccounts, nearAccountId }: {
     } catch (error) {
       console.error("Failed to unlink NEAR account:", error);
       toast.error("Failed to unlink NEAR account");
+    } finally {
+      setIsUnlinking(null);
+    }
+  };
+
+  const handleSetPrimaryNearAccount = async (account: any) => {
+    setIsUnlinking(account.accountId);
+    try {
+      const response = await authClient.near.setPrimaryAccount({
+        accountId: account.accountId,
+        network: account.network,
+      });
+      if (response.data?.success) {
+        toast.success("Active NEAR account updated");
+        invalidateAccounts();
+      } else {
+        toast.error("Failed to update active NEAR account");
+      }
+    } catch (error) {
+      console.error("Failed to update active NEAR account:", error);
+      toast.error("Failed to update active NEAR account");
     } finally {
       setIsUnlinking(null);
     }
@@ -486,9 +536,9 @@ function AccountLinkingCard({ linkedAccounts, nearAccountId }: {
     }
   };
 
-  const primaryAccount = accounts.find((acc) => acc.providerId === "siwn") || accounts[0];
+  const primaryAccount = accounts.find((acc) => acc.isActive || acc.isPrimary) || accounts[0];
   const secondaryAccounts = accounts.filter((acc) => acc !== primaryAccount);
-  const isProviderLinked = (providerId: string) => accounts.some((a) => a.providerId === providerId);
+  const isProviderLinked = (providerId: string) => accounts.some((a) => getAccountProviderId(a) === providerId);
   const canUnlinkAccount = (account: any) => account !== primaryAccount && accounts.length > 1;
 
   return (
@@ -509,9 +559,9 @@ function AccountLinkingCard({ linkedAccounts, nearAccountId }: {
             </h4>
             <div className="flex items-center justify-between p-3 border rounded-lg bg-muted/30">
               <div className="flex items-center gap-3">
-                <span className="text-lg">{getProviderIcon(primaryAccount.providerId)}</span>
+                <span className="text-lg">{getProviderIcon(getAccountProviderId(primaryAccount))}</span>
                 <div>
-                  <span className="font-medium">{getProviderName(primaryAccount.providerId)}</span>
+                  <span className="font-medium">{getProviderName(getAccountProviderId(primaryAccount))}</span>
                   <span className="text-sm text-muted-foreground ml-2">{primaryAccount.accountId}</span>
                 </div>
               </div>
@@ -526,21 +576,33 @@ function AccountLinkingCard({ linkedAccounts, nearAccountId }: {
             {secondaryAccounts.map((account) => (
               <div key={account.providerId || account.accountId} className="flex items-center justify-between p-3 border rounded-lg">
                 <div className="flex items-center gap-3">
-                  <span className="text-lg">{getProviderIcon(account.providerId)}</span>
+                  <span className="text-lg">{getProviderIcon(getAccountProviderId(account))}</span>
                   <div>
-                    <span className="font-medium">{getProviderName(account.providerId)}</span>
+                    <span className="font-medium">{getProviderName(getAccountProviderId(account))}</span>
                     <span className="text-sm text-muted-foreground ml-2">{account.accountId}</span>
                   </div>
                 </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => account.providerId === "siwn" ? handleUnlinkNearAccount(account) : handleUnlinkAccount(account.providerId)}
-                  disabled={isUnlinking === (account.providerId || account.accountId) || !canUnlinkAccount(account)}
-                  className="text-destructive hover:text-destructive"
-                >
-                  {isUnlinking === (account.providerId || account.accountId) ? "Unlinking..." : "Unlink"}
-                </Button>
+                <div className="flex items-center gap-2">
+                  {getAccountProviderId(account) === "siwn" && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleSetPrimaryNearAccount(account)}
+                      disabled={isUnlinking === (account.providerId || account.accountId)}
+                    >
+                      Set active
+                    </Button>
+                  )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => getAccountProviderId(account) === "siwn" ? handleUnlinkNearAccount(account) : handleUnlinkAccount(account.providerId)}
+                    disabled={isUnlinking === (account.providerId || account.accountId) || !canUnlinkAccount(account)}
+                    className="text-destructive hover:text-destructive"
+                  >
+                    {isUnlinking === (account.providerId || account.accountId) ? "Unlinking..." : "Unlink"}
+                  </Button>
+                </div>
               </div>
             ))}
           </div>
@@ -782,9 +844,16 @@ function SessionInfoCard({ user, nearAccountId, linkedAccounts, privateData }: {
   linkedAccounts: any[];
   privateData: any;
 }) {
-  const providerCount = linkedAccounts.length;
-  const nearAccountCount = linkedAccounts.filter(a => a.providerId === "siwn").length;
-  const socialAccountCount = providerCount - nearAccountCount;
+  const nearAccountCount = linkedAccounts.filter(a => getAccountProviderId(a) === "siwn").length;
+  const oauthAccountCount = linkedAccounts.filter(a => {
+    const providerId = getAccountProviderId(a);
+    return providerId !== "siwn" && providerId !== "unknown";
+  }).length;
+  const providerCount = nearAccountCount + oauthAccountCount;
+  const sessionId = privateData?.sessionId ?? null;
+  const expiresAt = privateData?.expiresAt ?? null;
+  const sessionIdLabel = typeof sessionId === "string" && sessionId.length > 0 ? `${sessionId.slice(0, 12)}...` : "N/A";
+  const expiresLabel = expiresAt ? new Date(expiresAt).toLocaleString() : "N/A";
 
   return (
     <div className="space-y-4">
@@ -802,21 +871,19 @@ function SessionInfoCard({ user, nearAccountId, linkedAccounts, privateData }: {
           </div>
           {privateData && (
             <div className="space-y-2 text-sm">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-4">
                 <span className="text-muted-foreground flex items-center gap-1.5">
                   <Key className="h-3.5 w-3.5" /> Session ID
                 </span>
                 <code className="font-mono text-xs bg-muted px-1.5 py-0.5 rounded">
-                  {privateData.sessionId?.slice(0, 12)}...
+                  {sessionIdLabel}
                 </code>
               </div>
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-4">
                 <span className="text-muted-foreground flex items-center gap-1.5">
                   <Clock className="h-3.5 w-3.5" /> Expires
                 </span>
-                <span className="text-xs">
-                  {privateData.expiresAt ? new Date(privateData.expiresAt).toLocaleString() : "N/A"}
-                </span>
+                <span className="text-xs text-right">{expiresLabel}</span>
               </div>
             </div>
           )}
@@ -831,27 +898,27 @@ function SessionInfoCard({ user, nearAccountId, linkedAccounts, privateData }: {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
-          <div className="flex items-center justify-between text-sm">
+          <div className="flex items-center justify-between gap-4 text-sm">
             <span className="text-muted-foreground">User</span>
-            <span className="font-medium">{user?.name || nearAccountId || "Unknown"}</span>
+            <span className="font-medium text-right">{user?.name || nearAccountId || "Unknown"}</span>
           </div>
-          <div className="flex items-center justify-between text-sm">
+          <div className="flex items-center justify-between gap-4 text-sm">
             <span className="text-muted-foreground">Email</span>
-            <span className="text-xs">{user?.email || "N/A"}</span>
+            <span className="text-xs text-right break-all">{user?.email || "N/A"}</span>
           </div>
-          <div className="flex items-center justify-between text-sm">
+          <div className="flex items-center justify-between gap-4 text-sm">
             <span className="text-muted-foreground">NEAR Account</span>
             {nearAccountId ? (
-              <code className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded">{nearAccountId}</code>
+              <code className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded text-right break-all">{nearAccountId}</code>
             ) : (
               <span className="text-xs text-muted-foreground">None</span>
             )}
           </div>
-          <div className="flex items-center justify-between text-sm">
+          <div className="flex items-center justify-between gap-4 text-sm">
             <span className="text-muted-foreground">Linked Providers</span>
             <div className="flex gap-1">
-              {nearAccountCount > 0 && <Badge variant="secondary" className="text-xs">NEAR</Badge>}
-              {socialAccountCount > 0 && <Badge variant="secondary" className="text-xs">{socialAccountCount} OAuth</Badge>}
+              {nearAccountCount > 0 && <Badge variant="secondary" className="text-xs">{nearAccountCount} NEAR</Badge>}
+              {oauthAccountCount > 0 && <Badge variant="secondary" className="text-xs">{oauthAccountCount} OAuth</Badge>}
               {providerCount === 0 && <span className="text-xs text-muted-foreground">None</span>}
             </div>
           </div>

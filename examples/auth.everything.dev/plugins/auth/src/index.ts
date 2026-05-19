@@ -37,6 +37,12 @@ interface UserWithAnonymous extends User {
   isAnonymous?: boolean | null;
 }
 
+const localDevTrustedOrigins = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "http://[::1]:3000",
+];
+
 function toORPCError(error: unknown) {
   if (error && typeof error === "object" && "status" in error) {
     const apiError = error as { status: number; message?: string; code?: string };
@@ -69,8 +75,7 @@ async function safeAuthApi<T>(fn: () => Promise<T>): Promise<T> {
 function ensureOrigin(value: string): string | null {
   if (/^https?:\/\//i.test(value)) {
     try {
-      new URL(value);
-      return value;
+      return new URL(value).origin;
     } catch {
       console.warn(`[Auth] Invalid origin URL: ${value}`);
       return null;
@@ -100,6 +105,9 @@ function parseTrustedOrigins(
   const baseUrl = domain ? ensureOrigin(domain) : "http://localhost:3000";
   const origins: string[] = [];
   if (baseUrl) origins.push(baseUrl);
+  if (process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test") {
+    origins.push(...localDevTrustedOrigins);
+  }
 
   if (corsOrigin) {
     for (const entry of corsOrigin.split(",")) {
@@ -120,14 +128,20 @@ export default createPlugin({
   variables: z.object({
     account: z.string().optional(),
     domain: z.string().optional(),
-    githubClientId: z.string().optional(),
-    githubClientSecret: z.string().optional(),
   }),
 
   secrets: z.object({
     AUTH_DATABASE_URL: z.string(),
     BETTER_AUTH_SECRET: z.string(),
     CORS_ORIGIN: z.string().optional(),
+    GITHUB_CLIENT_ID: z.string().optional(),
+    GITHUB_CLIENT_SECRET: z.string().optional(),
+    PASSKEY_RP_ID: z.string().optional(),
+    PASSKEY_RP_NAME: z.string().optional(),
+    PASSKEY_ORIGIN: z.string().optional(),
+    TWILIO_ACCOUNT_SID: z.string().optional(),
+    TWILIO_AUTH_TOKEN: z.string().optional(),
+    TWILIO_PHONE_NUMBER: z.string().optional(),
   }),
 
   context: z.object({
@@ -151,6 +165,20 @@ export default createPlugin({
         config.variables.domain,
         config.secrets.CORS_ORIGIN,
       );
+      // When CORS_ORIGIN is a localhost URL the server is running in local dev.
+      // The production passkey secrets (rpId / origin) won't match localhost
+      // and the browser will reject the WebAuthn ceremony.  Derive both values
+      // from the first CORS_ORIGIN entry instead so no extra config is needed.
+      const firstCorsOrigin = config.secrets.CORS_ORIGIN?.split(",")[0]?.trim();
+      const isLocalCorsOrigin =
+        !!firstCorsOrigin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(firstCorsOrigin);
+
+      const passkeyOrigin = isLocalCorsOrigin
+        ? firstCorsOrigin
+        : config.secrets.PASSKEY_ORIGIN
+          ? ensureOrigin(config.secrets.PASSKEY_ORIGIN)
+          : undefined;
+      const passkeyRpId = isLocalCorsOrigin ? undefined : config.secrets.PASSKEY_RP_ID;
 
       const auth = createAuthInstance(
         {
@@ -158,8 +186,14 @@ export default createPlugin({
           baseUrl,
           account: config.variables.account || "dev.everything.near",
           trustedOrigins,
-          githubClientId: config.variables.githubClientId,
-          githubClientSecret: config.variables.githubClientSecret,
+          githubClientId: config.secrets.GITHUB_CLIENT_ID,
+          githubClientSecret: config.secrets.GITHUB_CLIENT_SECRET,
+          passkeyRpId,
+          passkeyRpName: config.secrets.PASSKEY_RP_NAME,
+          passkeyOrigin: passkeyOrigin ?? undefined,
+          twilioAccountSid: config.secrets.TWILIO_ACCOUNT_SID,
+          twilioAuthToken: config.secrets.TWILIO_AUTH_TOKEN,
+          twilioPhoneNumber: config.secrets.TWILIO_PHONE_NUMBER,
         },
         driver.db,
       );
@@ -357,6 +391,164 @@ export default createPlugin({
         };
       }),
 
+      listOrganizations: builder.listOrganizations.use(requireAuth).handler(async ({ context }) => {
+        const memberships = await services.db.query.member.findMany({
+          where: eq(schema.member.userId, context.userId),
+          with: { organization: true },
+        });
+        return memberships
+          .filter((m) => m.organization != null)
+          .map((m) => ({
+            id: m.organization!.id,
+            name: m.organization!.name,
+            slug: m.organization!.slug,
+            logo: m.organization!.logo,
+            metadata: tryJsonParse<Record<string, unknown>>(m.organization!.metadata),
+            createdAt: m.organization!.createdAt,
+            role: m.role,
+          }));
+      }),
+
+      createOrganization: builder.createOrganization
+        .use(requireAuth)
+        .handler(async ({ input, context }) => {
+          const result = await safeAuthApi(() =>
+            services.auth.api.createOrganization({
+              headers: createHeaders(context.reqHeaders),
+              body: {
+                name: input.name,
+                slug: input.slug,
+                logo: input.logo,
+                metadata: input.metadata,
+              },
+            }),
+          );
+          const org = result as {
+            id: string;
+            name: string;
+            slug: string;
+            logo?: string | null;
+            metadata?: unknown;
+            createdAt: Date | string;
+          };
+          return {
+            id: org.id,
+            name: org.name,
+            slug: org.slug,
+            logo: org.logo ?? null,
+            metadata:
+              typeof org.metadata === "string"
+                ? tryJsonParse<Record<string, unknown>>(org.metadata)
+                : (org.metadata as Record<string, unknown> | undefined),
+            createdAt: org.createdAt instanceof Date ? org.createdAt : new Date(org.createdAt),
+          };
+        }),
+
+      setActiveOrganization: builder.setActiveOrganization
+        .use(requireAuth)
+        .handler(async ({ input, context }) => {
+          await safeAuthApi(() =>
+            services.auth.api.setActiveOrganization({
+              headers: createHeaders(context.reqHeaders),
+              body: { organizationId: input.organizationId },
+            }),
+          );
+          return { success: true };
+        }),
+
+      leaveOrganization: builder.leaveOrganization
+        .use(requireAuth)
+        .handler(async ({ input, context }) => {
+          const org = await services.db.query.organization.findFirst({
+            where: eq(schema.organization.id, input.id),
+          });
+          if (!org) throw new ORPCError("NOT_FOUND", { message: "Organization not found" });
+          if (org.slug === context.userId) {
+            throw new ORPCError("BAD_REQUEST", {
+              message: "Cannot leave your personal organization",
+            });
+          }
+
+          const membership = await services.db.query.member.findFirst({
+            where: and(
+              eq(schema.member.userId, context.userId),
+              eq(schema.member.organizationId, input.id),
+            ),
+          });
+          if (!membership) {
+            throw new ORPCError("NOT_FOUND", {
+              message: "You are not a member of this organization",
+            });
+          }
+
+          if (membership.role === "owner") {
+            const owners = await services.db.query.member.findMany({
+              where: and(
+                eq(schema.member.organizationId, input.id),
+                eq(schema.member.role, "owner"),
+              ),
+            });
+            if (owners.length <= 1) {
+              throw new ORPCError("BAD_REQUEST", {
+                message: "Transfer ownership before leaving — you are the last owner",
+              });
+            }
+          }
+
+          await services.db.delete(schema.member).where(eq(schema.member.id, membership.id));
+          return { success: true };
+        }),
+
+      inviteMember: builder.inviteMember.use(requireAuth).handler(async ({ input, context }) => {
+        const result = await safeAuthApi(() =>
+          services.auth.api.createInvitation({
+            headers: createHeaders(context.reqHeaders),
+            body: {
+              email: input.email,
+              role: input.role,
+              organizationId: input.organizationId,
+              resend: input.resend,
+            },
+          }),
+        );
+        const inv = result as typeof schema.invitation.$inferSelect;
+        return {
+          id: inv.id,
+          organizationId: inv.organizationId,
+          email: inv.email,
+          role: inv.role,
+          status: inv.status,
+          expiresAt: inv.expiresAt,
+          inviterId: inv.inviterId,
+        };
+      }),
+
+      getInvitation: builder.getInvitation.handler(async ({ input }) => {
+        const invitation = await services.db.query.invitation.findFirst({
+          where: eq(schema.invitation.id, input.id),
+          with: { organization: true },
+        });
+        if (!invitation) return null;
+        return {
+          id: invitation.id,
+          organizationId: invitation.organizationId,
+          email: invitation.email,
+          role: invitation.role,
+          status: invitation.status,
+          expiresAt: invitation.expiresAt,
+          inviterId: invitation.inviterId,
+          organization: invitation.organization
+            ? {
+                id: invitation.organization.id,
+                name: invitation.organization.name,
+                slug: invitation.organization.slug,
+                logo: invitation.organization.logo,
+                metadata: tryJsonParse<Record<string, unknown>>(invitation.organization.metadata),
+              }
+            : null,
+        };
+      }),
+
       getOrganization: builder.getOrganization
         .use(requireAuth)
         .handler(async ({ input, context }) => {
@@ -478,10 +670,17 @@ export default createPlugin({
         }),
 
       listApiKeys: builder.listApiKeys.use(requireAuth).handler(async ({ context, input }) => {
+        const query: Record<string, string | number> = {};
+        if (input?.organizationId) query.organizationId = input.organizationId;
+        if (input?.limit !== undefined) query.limit = input.limit;
+        if (input?.offset !== undefined) query.offset = input.offset;
+        if (input?.sortBy) query.sortBy = input.sortBy;
+        if (input?.sortDirection) query.sortDirection = input.sortDirection;
+
         const result = await safeAuthApi(() =>
           services.auth.api.listApiKeys({
             headers: createHeaders(context.reqHeaders),
-            query: input?.organizationId ? { organizationId: input.organizationId } : undefined,
+            query: Object.keys(query).length > 0 ? query : undefined,
           }),
         );
         return (result as { apiKeys?: Array<z.infer<typeof apiKeySchema>> }).apiKeys ?? [];
@@ -490,10 +689,17 @@ export default createPlugin({
       createApiKey: builder.createApiKey.use(requireAuth).handler(async ({ input, context }) => {
         const result = await safeAuthApi(() =>
           services.auth.api.createApiKey({
-            headers: createHeaders(context.reqHeaders),
             body: {
-              ...input,
+              userId: context.userId,
+              name: input.name,
+              prefix: input.prefix,
+              expiresIn: input.expiresIn,
               permissions: input.permissions,
+              metadata: input.metadata,
+              organizationId: input.organizationId,
+              rateLimitEnabled: input.rateLimit?.enabled,
+              rateLimitMax: input.rateLimit?.max,
+              rateLimitTimeWindow: input.rateLimit?.timeWindow,
             },
           }),
         );
@@ -503,13 +709,17 @@ export default createPlugin({
       updateApiKey: builder.updateApiKey.use(requireAuth).handler(async ({ input, context }) => {
         const result = await safeAuthApi(() =>
           services.auth.api.updateApiKey({
-            headers: createHeaders(context.reqHeaders),
             body: {
+              userId: context.userId,
               keyId: input.id,
               name: input.name,
+              enabled: input.enabled,
               permissions: input.permissions,
               metadata: input.metadata,
-              expiresAt: input.expiresAt,
+              expiresIn: input.expiresIn,
+              rateLimitEnabled: input.rateLimit?.enabled,
+              rateLimitMax: input.rateLimit?.max,
+              rateLimitTimeWindow: input.rateLimit?.timeWindow,
             },
           }),
         );
@@ -528,6 +738,30 @@ export default createPlugin({
         } catch {
           throw new ORPCError("NOT_FOUND", { message: "API key not found" });
         }
+      }),
+
+      verifyApiKey: builder.verifyApiKey.handler(async ({ input, context }) => {
+        const result = await safeAuthApi(() =>
+          services.auth.api.verifyApiKey({
+            headers: createHeaders(context.reqHeaders),
+            body: {
+              key: input.key,
+              permissions: input.permissions,
+            },
+          }),
+        );
+        const r = result as {
+          valid: boolean;
+          error?: { code?: string; message?: string } | null;
+          key?: z.infer<typeof apiKeySchema> | null;
+        };
+        return {
+          valid: r.valid,
+          error: r.error
+            ? { code: r.error.code ?? "UNKNOWN", message: r.error.message ?? undefined }
+            : null,
+          key: r.key ?? null,
+        };
       }),
 
       listMembers: builder.listMembers.use(requireAuth).handler(async ({ input }) => {

@@ -29,9 +29,15 @@ export interface AuthConfig {
   trustedOrigins?: string[];
   githubClientId?: string;
   githubClientSecret?: string;
+  passkeyRpId?: string;
+  passkeyRpName?: string;
+  passkeyOrigin?: string;
   fastnearApiKey?: string;
   nearRpcUrl?: string;
   isProduction?: boolean;
+  twilioAccountSid?: string;
+  twilioAuthToken?: string;
+  twilioPhoneNumber?: string;
 }
 
 export type AuthDatabase = PgDatabase<PgQueryResultHKT, Record<string, unknown>>;
